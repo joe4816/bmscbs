@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FNB58 Connector</title>
+<style>
+  body {
+    font-family: Arial, sans-serif;
+    background:#0f172a;
+    color:#f1f5f9;
+    min-height:100vh;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    gap:18px;
+    padding:20px;
+    text-align:center;
+  }
+
+  button {
+    font-size:24px;
+    padding:22px 36px;
+    border-radius:16px;
+    border:0;
+    background:#3b82f6;
+    color:white;
+    font-weight:bold;
+  }
+
+  button:disabled {
+    opacity:.55;
+  }
+
+  #status {
+    max-width:480px;
+    padding:16px;
+    border-radius:12px;
+    background:#1e293b;
+    color:#cbd5e1;
+    font-size:18px;
+  }
+
+  .ok { color:#86efac; }
+  .bad { color:#fca5a5; }
+  .warn { color:#fbbf24; }
+
+  .reading {
+    font-family:monospace;
+    font-size:22px;
+    color:#fbbf24;
+  }
+</style>
+</head>
+<body>
+
+<h1>FNB58 Connector</h1>
+<div id="status">Click Connect Meter. Keep this window open.</div>
+<button id="btn" onclick="connect()">Connect Meter</button>
+<div class="reading" id="reading">No reading yet</div>
+
+<script>
+const VID = 0x2E3C;
+const PID = 0x5558;
+
+let dev = null;
+let keepAliveTimer = null;
+let pktCount = 0;
+
+function st(msg, cls='') {
+  const el = document.getElementById('status');
+  el.className = cls;
+  el.textContent = msg;
+}
+
+function makeCommand(type, checksum) {
+  const data = new Uint8Array(64);
+  data[0] = 0xaa;
+  data[1] = type;
+  data[63] = checksum;
+  return data;
+}
+
+const CMD_81 = makeCommand(0x81, 0x8e);
+const CMD_82 = makeCommand(0x82, 0x96);
+const CMD_83 = makeCommand(0x83, 0x9e);
+
+function sendReading(sample) {
+  document.getElementById('reading').textContent =
+    sample.voltage.toFixed(2) + 'V / ' +
+    sample.current.toFixed(2) + 'A / ' +
+    sample.watts.toFixed(1) + 'W / ' +
+    sample.tempC.toFixed(1) + '°C';
+
+  if (window.opener) {
+    window.opener.postMessage({
+      type: 'FNB58_READING',
+      voltage: sample.voltage,
+      current: sample.current,
+      watts: sample.watts,
+      tempC: sample.tempC
+    }, '*');
+  }
+}
+
+function decodePacket(e) {
+  pktCount++;
+
+  const d = e.data;
+  if (!d || d.byteLength < 64) return;
+
+  const b0 = d.getUint8(0);
+  const b1 = d.getUint8(1);
+
+  if (b0 !== 0xaa || b1 !== 0x04) return;
+
+  let bestSample = null;
+
+  for (let sampleNum = 0; sampleNum < 4; sampleNum++) {
+    const off = 2 + sampleNum * 15;
+    if (off + 14 >= d.byteLength) continue;
+
+    const voltage = d.getUint32(off, true) / 100000;
+    const current = d.getUint32(off + 4, true) / 100000;
+    const tempC = d.getUint16(off + 13, true) / 10;
+    const watts = voltage * current;
+
+    if (
+      Number.isFinite(voltage) &&
+      Number.isFinite(current) &&
+      Number.isFinite(tempC) &&
+      voltage >= 0 &&
+      voltage <= 30 &&
+      current >= 0 &&
+      current <= 10 &&
+      tempC >= -20 &&
+      tempC <= 120
+    ) {
+      if (!bestSample || watts > bestSample.watts) {
+        bestSample = { voltage, current, watts, tempC };
+      }
+    }
+  }
+
+  if (bestSample) sendReading(bestSample);
+}
+
+async function sendReport0(data) {
+  await dev.sendReport(0, data);
+}
+
+async function connect() {
+  if (!navigator.hid) {
+    st('WebHID not available here.', 'bad');
+    return;
+  }
+
+  try {
+    st('Select FNB-58 from the popup…', 'warn');
+
+    const devices = await navigator.hid.requestDevice({
+      filters: [{ vendorId: VID, productId: PID }]
+    });
+
+    if (!devices.length) {
+      st('No meter selected.', 'bad');
+      return;
+    }
+
+    dev = devices[0];
+
+    dev.addEventListener('inputreport', decodePacket);
+    await dev.open();
+
+    st('Connected. Sending init sequence…', 'warn');
+
+    await new Promise(r => setTimeout(r, 1000));
+
+    await sendReport0(CMD_81);
+    await new Promise(r => setTimeout(r, 100));
+
+    await sendReport0(CMD_82);
+    await new Promise(r => setTimeout(r, 100));
+
+    await sendReport0(CMD_82);
+    await new Promise(r => setTimeout(r, 100));
+
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = setInterval(async () => {
+      try {
+        await dev.sendReport(0, CMD_83);
+      } catch (e) {
+        clearInterval(keepAliveTimer);
+        st('Meter disconnected.', 'bad');
+      }
+    }, 1000);
+
+    st('Connected. Return to Station 2. Keep this window open.', 'ok');
+
+    document.getElementById('btn').textContent = 'Connected';
+    document.getElementById('btn').disabled = true;
+
+  } catch (e) {
+    st(e.name + ': ' + e.message, 'bad');
+  }
+}
+</script>
+
+</body>
+</html>
